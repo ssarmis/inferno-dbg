@@ -26,11 +26,19 @@ typedef double r64;
 #include <sys/user.h>
 #include <unistd.h>
 
+#define EXECUTABLE_BASE_ADDRESS         0
+#define EXECUTABLE_BASE_STACK_ADDRESS   1
+
+#define EXECUTABLE_ARRAY_MAXIMUM_SIZE   ((EXECUTABLE_BASE_STACK_ADDRESS) + 1)
+
 struct Process {
+    bool alive;
+    bool steppingIsEnabled;
     pid_t pid;
     bool available;
     int lastSignalStatus;
     user_regs_struct registers;
+    u64 memoryMap[EXECUTABLE_ARRAY_MAXIMUM_SIZE];
 };
 
 template<typename T>
@@ -61,6 +69,54 @@ static inline void bufferAppend(Buffer<T>* buffer, T* entry){
 
     buffer->array[buffer->currentAmount] = *entry;
     ++buffer->currentAmount;
+}
+
+static inline u8 hexCharToDec(char character){
+    // TODO(Sarmis) maybe move to a hardcoded array table
+    // faster conversion
+    if(character >= 'a' && character <= 'f') {
+        return (10 + character - 'a');
+    } else if(character >= 'A' && character <= 'F'){
+        return (10 + character - 'A');
+    }
+
+    // this assumes a valid character in inserted
+    return (character - '0');
+}
+
+static inline u64 readuHexToDec(u8* buffer){
+    u64 result = 0;
+    u32 size = 0;
+    
+    if((buffer[1] == 'x' || buffer[1] == 'X')){
+        if(buffer[0] != '0'){
+            ERROR("Invalid string, can't parse to dec. \n");
+            return -1;
+        } else {
+            buffer += 2; /*0x*/
+        }
+    }
+
+    while((*buffer >= 'a' && *buffer <= 'f') ||
+          (*buffer >= 'A' && *buffer <= 'F') ||
+          (*buffer >= '0' && *buffer <= '9')){
+        ++size;
+        ++buffer;
+        if(size > 16){
+            ERROR("Number too big to parse to dec.\n");
+            break;
+        }
+    }
+
+    buffer -= size;
+
+    while(size){
+        u64 mask = ((u64)hexCharToDec(*buffer)) << (4 * (--size));
+        result |= mask;
+        ++buffer;
+    }
+
+    return result;
 }
 
 static inline char* readStringFromBuffer(u8* buffer, u32* size, u32* offset){

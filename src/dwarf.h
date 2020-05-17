@@ -1,8 +1,15 @@
 #pragma once
 
+enum BreakpointType : u8 {
+    BREAKPOINT_NONE, 
+    BREAKPOINT_INTERNAL,
+    BREAKPOINT_USER
+};
+
 struct Breakpoint {
+    BreakpointType type;
     u64 address;
-    u8 originalByteCode;
+    u8 originalMachineCode;
 };
 
 enum {

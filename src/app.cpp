@@ -1,3 +1,9 @@
+// TODO(Sarmis)
+//      - fix the debugger stops working when was "debugging" the debugger it self
+//      - there is a problem with showing the proper file when stepping(I think, or at least
+//         a problem with the stepping)
+//      - redirect children output
+
 // g++ -o a gl.cpp imgui*.cpp app.cpp -lSDL2main -lSDL2 -lX11 -lGLU -lGL -lXext -DIMGUI_IMPL_OPENGL_LOADER_CUSTOM="\"gl.h\"" -g; ./a
 #include "gl.h"
 #include "imgui.h"
@@ -39,7 +45,7 @@ static inline void createRegistersWindow(u32 width, u32 height, const char* name
                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
     updateRegisters();
-    ImGui::Text("RIP: %08x", childProcess.registers.rip);
+    ImGui::Text("RIP: %llx", childProcess.registers.rip);
 
     ImGui::End();
 }
@@ -195,8 +201,9 @@ int main(int argumentsCount, char* arguments[]){
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
     rangeEntries = dwarfReadDebugData(arguments[1]);
-
+    
     bool failedToLoadCompilationUnits = !rangeEntries.currentAmount;
+    // TODO(Sarmis) fail nicely
 
     u32 mainCompilationUnitIndex = getMainCompilationUnitIndex(rangeEntries);
 
@@ -204,6 +211,8 @@ int main(int argumentsCount, char* arguments[]){
     DWARFDebugCompilationUnit mainCompilationUnit = rangeEntries.array[mainCompilationUnitIndex].compilationUnit;
     DWARFCompilationUnitDetail entryRoutine = getMainEntryPointSubprogram(mainCompilationUnit);
     u64 entryPointLowPC = componentGetLowPC(entryRoutine);
+
+    TRACE("Entry point is %llx\n", entryPointLowPC);
 
     File file = {};
     u64 line;
@@ -220,7 +229,7 @@ int main(int argumentsCount, char* arguments[]){
     file = fileRead(filename);
 #if 1
     char* launchArguments[] = {
-        NULL
+        arguments[1], "./test", NULL
     };
 
     launchChildProcess(arguments[1], launchArguments);
@@ -230,23 +239,24 @@ int main(int argumentsCount, char* arguments[]){
         return 1;
     }
 
-    TRACE("Create child with pid %d\n", childProcess.pid);
     
-    debugWaitForProcessToBeAvailable();
     // breakpoint on entry
-    debugSetBreakpoint(&rangeEntries.array[mainCompilationUnitIndex].compilationUnit, entryPointLowPC);
-    // debugSetBreakpoint(&rangeEntries.array[mainCompilationUnitIndex].compilationUnit, findAddressByLineNumber(&rangeEntries.array[mainCompilationUnitIndex].compilationUnit, 16));
+    childProcess.steppingIsEnabled = true;
+    // debugSetBreakpointUser(&rangeEntries.array[mainCompilationUnitIndex].compilationUnit, entryPointLowPC);
+    for(int rangeEntry = 0; rangeEntry < rangeEntries.currentAmount; ++rangeEntry){
+        debugSetBreakpointsOnAllLines(&rangeEntries.array[rangeEntry].compilationUnit);
+    }
+    // debugSetBreakpointUser(&rangeEntries.array[mainCompilationUnitIndex].compilationUnit, findAddressByLineNumber(&rangeEntries.array[mainCompilationUnitIndex].compilationUnit, 6));
     debugContinue();
 #endif
-    u64 opcodes = get64(entryPointLowPC);
-
     bool done = false;
     
-    while(!done){
-        DWARFDebugRangeSetEntry* rangeSetEntry = findRangeSetEntryByAddress(&rangeEntries, childProcess.registers.rip);
+    while(!done && childProcess.alive){
+        u64 relativeRIP = childProcess.registers.rip - childProcess.memoryMap[EXECUTABLE_BASE_ADDRESS];
+        DWARFDebugRangeSetEntry* rangeSetEntry = findRangeSetEntryByAddress(&rangeEntries, relativeRIP);
         if(rangeSetEntry){
             file = rangeSetEntry->file;
-            line = findLineNumberByAddress(&(rangeSetEntry->compilationUnit), childProcess.registers.rip);
+            line = findLineNumberByAddress(&(rangeSetEntry->compilationUnit), relativeRIP);
         }
         SDL_Event event;
         if (SDL_PollEvent(&event)) {

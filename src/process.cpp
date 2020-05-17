@@ -13,13 +13,19 @@ void attach(pid_t pid){
 void set64(u64 address, u64 data){
     int status = ptrace(PTRACE_POKETEXT, childProcess.pid, address, data);
     if(status){
-        ERROR("Could not poke text with 0x%08x at 0x%08x\n", data, address);
+        ERROR("Could not poke text with 0x%llx at 0x%llx\n", data, address);
         ERROR("Error: %d\n", errno);
     }
 }
 
 u64 get64(u64 address){
-    return ptrace(PTRACE_PEEKTEXT, childProcess.pid, address, NULL);
+    errno = 0;
+    u64 result = ptrace(PTRACE_PEEKTEXT, childProcess.pid, address, NULL);
+    if(result == -1 && errno != 0){
+        ERROR("Could not peek text at 0x%llx\n", address);
+        assert(false);
+    }
+    return result;
 }
 
 u8 get8(u64 address){
@@ -38,6 +44,31 @@ void debugWaitForProcessToBeAvailable(){
     }
 }
 
+static inline void parseMapsFileForProcess(pid_t pid, u64* map){
+    // TODO(Sarmis) implement better parsing, not just reading 16 bytes and
+    // assuming its always what we want
+    char tmpCmd[128];
+    char filename[128];
+    sprintf(filename, "/proc/%d/maps", pid);
+    sprintf(tmpCmd, "cat /proc/%d/maps", pid);
+
+    File mapsFile = fileRead(filename);
+
+    // read just the first offset
+    u8 data[16] = {};
+    read(mapsFile.descriptor, data, 16);
+    // system(tmpCmd);
+    TRACE("%c%c%c%c%c%c%c%c\n",
+          data[0], data[1], data[2], data[3],
+          data[4], data[5], data[6], data[7]);
+    // system(tmpCmd);
+
+    map[EXECUTABLE_BASE_ADDRESS] = readuHexToDec(data);
+    TRACE("Process base address %llx\n", map[EXECUTABLE_BASE_ADDRESS]);
+    
+    fileClose(&mapsFile);
+}
+
 void launchChildProcess(const char* filename, char* arguments[]){
     signalChildHandlerStructure.sa_sigaction = signalChildHandler;
     signalChildHandlerStructure.sa_flags = SA_SIGINFO;
@@ -47,7 +78,8 @@ void launchChildProcess(const char* filename, char* arguments[]){
         return;
     }
 
-    fflush(stdout);
+    childProcess.alive = true;
+    childProcess.steppingIsEnabled = false;
     childProcess.available = false;
     childProcess.pid = fork();
 
@@ -64,10 +96,15 @@ void launchChildProcess(const char* filename, char* arguments[]){
         }
         execv(filename, arguments);
     }
+    TRACE("Create child with pid %d\n", childProcess.pid);
+
+    debugWaitForProcessToBeAvailable();
+    parseMapsFileForProcess(childProcess.pid, childProcess.memoryMap);
 }
 
 
 void debugStepInstruction(){
+    childProcess.steppingIsEnabled = true;
     ptrace(PTRACE_SINGLESTEP, childProcess.pid, NULL, NULL);
     childProcess.available = false; // TODO(Sarmis) mutex this
 }
@@ -75,42 +112,60 @@ void debugStepInstruction(){
 // void debugSetBreakpointOnLine(DWARFDebugCompilationUnit* compilationUnit, u32 line){
 // }
 
-void debugSetBreakpoint(DWARFDebugCompilationUnit* compilationUnit, u64 address){
+void debugSetBreakpointUser(DWARFDebugCompilationUnit* compilationUnit, u64 address){
+    debugSetBreakpoint(BREAKPOINT_USER, compilationUnit, address);
+}
+
+void debugSetBreakpoint(BreakpointType type, DWARFDebugCompilationUnit* compilationUnit, u64 address){
     Breakpoint breakpoint = {};
-    // TODO(Sarmis) fix EIO problems with PEEKTEXT into virtual address space
-    // for now this is only on Ubuntu, its working fine on Fedora 28
-    breakpoint.address = address;
+    breakpoint.type = type;
+
+    u64 offset = childProcess.memoryMap[EXECUTABLE_BASE_ADDRESS];
+
+    breakpoint.address = offset + address;
     errno = 0;
-    ERROR("Error? %d\n", errno);
     u8 tmp = get8(breakpoint.address + 1);
-    TRACE("Next byte code 0x%08x from address 0x%08x\n", tmp, breakpoint.address + 1);
-    ERROR("Error? %d\n", errno);
 
     u64 opcodes = 0;
     errno = 0;
-    ERROR("Error? %d\n", errno);
-    opcodes = get64(address);
-    ERROR("Error? %d\n", errno);
-    breakpoint.originalByteCode = opcodes & 0xff;
-    TRACE("Original byte code 0x%08x from address 0x%08x\n", opcodes, breakpoint.address);
+    opcodes = get64(breakpoint.address);
+    breakpoint.originalMachineCode = opcodes & 0xff;
 
     u64 interuptMask = ((opcodes >> 8) << 8) | 0xcc;
 
-    set64(address, interuptMask);
-    tmp = get8(address);
-    TRACE("New byte code 0x%08x from address 0x%08x\n", tmp, breakpoint.address);
+    set64(breakpoint.address, interuptMask);
+    tmp = get8(breakpoint.address);
 
     tmp = get8(breakpoint.address + 1);
-    TRACE("Next byte code 0x%08x from address 0x%08x\n", tmp, breakpoint.address + 1);
 
     bufferAppend<Breakpoint>(&compilationUnit->breakpoints, &breakpoint);
 }
 
-void debugStepLine(/*, u64 line */){
-    // TODO(Sarmis) Implement me
+void debugStepLine(){
+    // TODO(Sarmis) what the fuck is this ?
+    childProcess.lastSignalStatus = true;
+    //
+
+    childProcess.steppingIsEnabled = true;
+    debugContinue();
 }
 
 void debugContinue(){
     ptrace(PTRACE_CONT, childProcess.pid, NULL, NULL);
     childProcess.available = false; // TODO(Sarmis) mutex this
+}
+
+void debugSetBreakpointsOnAllLines(DWARFDebugCompilationUnit* compilationUnit){
+    for(int i = 0; i < compilationUnit->fileEntries.currentAmount; ++i){
+        DWARFDebugFileEntry fileEntry = compilationUnit->fileEntries.array[i];
+        u32 lastLine = 0;
+        for(int file = 0; file < fileEntry.array.currentAmount; ++file){
+            if(lastLine == fileEntry.array.array[file].line){
+                continue;
+            }
+
+            lastLine = fileEntry.array.array[file].line;
+            debugSetBreakpoint(BREAKPOINT_INTERNAL, compilationUnit, fileEntry.array.array[file].address);
+        }
+    }
 }
